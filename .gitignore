@@ -1,0 +1,4 @@
+# Exclude environment variables
+.env
+.env.local
+.env.*
