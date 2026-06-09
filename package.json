@@ -8,6 +8,8 @@
     "mongodb": "^7.0.0",
     "mongoose": "^9.0.1",
     "multer": "^2.0.2",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.9",
     "stripe": "^14.0.0"
   }
 }
