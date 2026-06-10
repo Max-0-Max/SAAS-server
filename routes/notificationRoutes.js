@@ -9,17 +9,14 @@ const { sendEmail } = require('../jobs/notificationJob');
 
 /* ══════════════════════════════════════════════════════════════
    NOTIFICATION PREFERENCES
-   GET  /api/notifications/prefs       → get current user's prefs
-   PUT  /api/notifications/prefs       → update prefs
+   GET  /api/notifications/prefs
+   PUT  /api/notifications/prefs
 ══════════════════════════════════════════════════════════════ */
 
 router.get('/prefs', authMiddleware, async (req, res) => {
   try {
     let prefs = await NotificationPrefs.findOne({ user_id: req.userId });
-    if (!prefs) {
-      // Create defaults on first fetch
-      prefs = await NotificationPrefs.create({ user_id: req.userId });
-    }
+    if (!prefs) prefs = await NotificationPrefs.create({ user_id: req.userId });
     res.json(formatPrefs(prefs));
   } catch (err) {
     console.error('GET /prefs', err);
@@ -61,14 +58,10 @@ function formatPrefs(p) {
 
 /* ══════════════════════════════════════════════════════════════
    TEAM COLLABORATION
-   GET    /api/notifications/team          → list my team members
-   POST   /api/notifications/team/invite   → invite by email
-   PUT    /api/notifications/team/:id/role → change role
-   DELETE /api/notifications/team/:id      → remove member
-   GET    /api/notifications/team/accept   → accept invite (token link)
+   ⚠ ORDER MATTERS: specific routes before /:id wildcard routes
 ══════════════════════════════════════════════════════════════ */
 
-// List all members in my workspace
+// GET  /api/notifications/team          — list workspace members
 router.get('/team', authMiddleware, async (req, res) => {
   try {
     const members = await TeamMember.find({ owner_id: req.userId }).sort({ createdAt: 1 });
@@ -78,51 +71,89 @@ router.get('/team', authMiddleware, async (req, res) => {
   }
 });
 
-// Invite a new member by email
+// GET  /api/notifications/team/accept   — accept invite via token link
+// ⚠ MUST be before /team/:id routes
+router.get('/team/accept', async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (!token) return res.status(400).json({ message: 'Invalid invite link' });
+
+    const member = await TeamMember.findOne({ invite_token: token });
+    if (!member) return res.status(404).json({ message: 'Invite not found or already used' });
+
+    const user = await User.findOne({ email: member.email });
+    member.status = 'active';
+    if (user) member.user_id = user._id;
+    member.invite_token = null;
+    await member.save();
+
+    const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+    res.redirect(`${clientUrl}/auth?email=${encodeURIComponent(member.email)}&invited=1`);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// POST /api/notifications/team/invite   — invite by email
+// ⚠ MUST be before /team/:id routes
 router.post('/team/invite', authMiddleware, async (req, res) => {
   try {
     const { email, role = 'member' } = req.body;
+
     if (!email) return res.status(400).json({ message: 'Email is required' });
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
       return res.status(400).json({ message: 'Invalid email address' });
+    if (!['admin', 'member', 'viewer'].includes(role))
+      return res.status(400).json({ message: 'Invalid role' });
 
-    // Check not already a member
     const existing = await TeamMember.findOne({ owner_id: req.userId, email });
     if (existing) return res.status(409).json({ message: 'This person is already on your team' });
 
-    // Check if the invited email already has a Nexus account
     const invitedUser = await User.findOne({ email });
     const token = crypto.randomBytes(24).toString('hex');
 
     const member = await TeamMember.create({
-      owner_id: req.userId,
+      owner_id:     req.userId,
       email,
-      name: invitedUser ? invitedUser.name : email.split('@')[0],
+      name:         invitedUser ? (invitedUser.name || invitedUser.email) : email.split('@')[0],
       role,
-      status: invitedUser ? 'active' : 'pending',
-      user_id: invitedUser ? invitedUser._id : null,
+      status:       invitedUser ? 'active' : 'pending',
+      user_id:      invitedUser ? invitedUser._id : null,
       invite_token: token,
     });
 
     // Send invite email
-    const owner = await User.findById(req.userId);
+    const owner = await User.findById(req.userId).select('name email');
     const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
     const acceptUrl = `${clientUrl}/invite?token=${token}`;
-
-    const roleLabel = { admin: 'Admin', member: 'Member', viewer: 'Viewer' }[role] || role;
+    const roleLabel = { admin: 'Admin', member: 'Member', viewer: 'Viewer' }[role];
 
     await sendEmail({
       to: email,
       subject: `${owner.name} invited you to their Nexus workspace`,
       html: `
-        <div style="font-family: sans-serif; max-width: 560px; margin: 0 auto;">
-          <h2 style="color: #6C47FF;">You've been invited to Nexus 🎉</h2>
-          <p><strong>${owner.name}</strong> (${owner.email}) has invited you to join their workspace as a <strong>${roleLabel}</strong>.</p>
-          <p>Nexus is a productivity platform for managing tasks, habits, goals, and time — all in one place.</p>
-          <a href="${acceptUrl}" style="display:inline-block; margin: 20px 0; padding: 12px 28px; background: #6C47FF; color: white; border-radius: 10px; text-decoration: none; font-weight: bold;">
-            Accept Invitation →
-          </a>
-          <p style="color: #888; font-size: 13px;">This link expires in 7 days. If you didn't expect this, you can safely ignore it.</p>
+        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;">
+          <div style="background:linear-gradient(135deg,#6C47FF,#A855F7);padding:28px 32px;border-radius:16px 16px 0 0;">
+            <h1 style="margin:0;color:white;font-size:22px;">✦ Nexus</h1>
+          </div>
+          <div style="background:#fff;padding:32px;border-radius:0 0 16px 16px;border:1px solid #e8e7f0;border-top:none;">
+            <h2 style="margin:0 0 12px;color:#1a1a2e;">You've been invited! 🎉</h2>
+            <p style="color:#555;margin:0 0 8px;">
+              <strong>${owner.name}</strong> (${owner.email}) invited you to join their
+              Nexus workspace as a <strong>${roleLabel}</strong>.
+            </p>
+            <p style="color:#555;margin:0 0 24px;">
+              Nexus is an all-in-one productivity platform for tasks, habits, goals, and time tracking.
+            </p>
+            <a href="${acceptUrl}"
+               style="display:inline-block;padding:13px 28px;background:#6C47FF;color:white;
+                      border-radius:10px;text-decoration:none;font-weight:700;font-size:15px;">
+              Accept Invitation →
+            </a>
+            <p style="color:#aaa;font-size:12px;margin-top:24px;">
+              This link expires in 7 days. Ignore this email if you weren't expecting it.
+            </p>
+          </div>
         </div>
       `,
     });
@@ -130,11 +161,12 @@ router.post('/team/invite', authMiddleware, async (req, res) => {
     res.status(201).json({ message: 'Invitation sent', member: formatMember(member) });
   } catch (err) {
     console.error('POST /team/invite', err);
+    if (err.code === 11000) return res.status(409).json({ message: 'This person is already on your team' });
     res.status(500).json({ message: 'Failed to send invitation' });
   }
 });
 
-// Change a member's role
+// PUT  /api/notifications/team/:id/role — change a member's role
 router.put('/team/:id/role', authMiddleware, async (req, res) => {
   try {
     const { role } = req.body;
@@ -153,7 +185,7 @@ router.put('/team/:id/role', authMiddleware, async (req, res) => {
   }
 });
 
-// Remove a member
+// DELETE /api/notifications/team/:id   — remove a member
 router.delete('/team/:id', authMiddleware, async (req, res) => {
   try {
     const member = await TeamMember.findOneAndDelete({ _id: req.params.id, owner_id: req.userId });
@@ -164,42 +196,14 @@ router.delete('/team/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Accept invite via token (called when invited user clicks the link)
-router.get('/team/accept', async (req, res) => {
-  try {
-    const { token } = req.query;
-    if (!token) return res.status(400).json({ message: 'Invalid invite link' });
-
-    const member = await TeamMember.findOne({ invite_token: token });
-    if (!member) return res.status(404).json({ message: 'Invite not found or already used' });
-
-    // Try to match to an existing user
-    const user = await User.findOne({ email: member.email });
-    if (user) {
-      member.status = 'active';
-      member.user_id = user._id;
-    } else {
-      member.status = 'active'; // mark accepted even if they need to register
-    }
-    member.invite_token = null; // consume token
-    await member.save();
-
-    const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
-    // Redirect to auth with pre-filled email
-    res.redirect(`${clientUrl}/auth?email=${encodeURIComponent(member.email)}&invited=1`);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
 function formatMember(m) {
   return {
-    id:        m._id,
-    email:     m.email,
-    name:      m.name,
-    role:      m.role,
-    status:    m.status,
-    joinedAt:  m.createdAt,
+    id:       m._id,
+    email:    m.email,
+    name:     m.name,
+    role:     m.role,
+    status:   m.status,
+    joinedAt: m.createdAt,
   };
 }
 
