@@ -4,8 +4,10 @@ const jwt = require('jsonwebtoken');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
+const crypto = require('crypto');
 const User = require('../models/User');
 const authMiddleware = require('../middleware/auth');
+const { sendEmail } = require('../jobs/notificationJob');
 require('dotenv').config();
 
 const router = express.Router();
@@ -170,6 +172,109 @@ router.delete('/me', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server Error' });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════
+   FORGOT PASSWORD — OTP via email
+   POST /api/auth/forgot-password   { email }
+   POST /api/auth/verify-otp        { email, otp }
+   POST /api/auth/reset-password    { email, otp, newPassword }
+══════════════════════════════════════════════════════════════ */
+
+/** Generate a 6-digit OTP */
+function generateOtp() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+/* Step 1 — send OTP to email */
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ message: 'Email is required' });
+
+  try {
+    const user = await User.findOne({ email });
+    // Always respond 200 so we don't leak whether an account exists
+    if (!user) return res.json({ message: 'If that email exists, an OTP has been sent.' });
+
+    const otp = generateOtp();
+    const expiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    user.resetOtp = otp;
+    user.resetOtpExpiry = expiry;
+    await user.save();
+
+    await sendEmail({
+      to: email,
+      subject: 'Your Nexus password reset code',
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;">
+          <div style="background:linear-gradient(135deg,#6C47FF,#A855F7);padding:28px 32px;border-radius:16px 16px 0 0;">
+            <h1 style="margin:0;color:white;font-size:22px;">✦ Nexus</h1>
+          </div>
+          <div style="background:#fff;padding:32px;border-radius:0 0 16px 16px;border:1px solid #e8e7f0;border-top:none;">
+            <h2 style="margin:0 0 12px;color:#1a1a2e;">Password Reset</h2>
+            <p style="color:#555;margin:0 0 20px;">
+              Use the code below to reset your Nexus password. It expires in <strong>10 minutes</strong>.
+            </p>
+            <div style="background:#F4F4F8;border-radius:12px;padding:20px;text-align:center;margin-bottom:20px;">
+              <span style="font-size:36px;font-weight:800;letter-spacing:10px;color:#6C47FF;">${otp}</span>
+            </div>
+            <p style="color:#aaa;font-size:12px;margin:0;">
+              If you didn't request this, you can safely ignore this email.
+            </p>
+          </div>
+        </div>
+      `,
+    });
+
+    res.json({ message: 'If that email exists, an OTP has been sent.' });
+  } catch (err) {
+    console.error('POST /forgot-password', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+/* Step 2 — verify OTP (optional pre-check before setting new password) */
+router.post('/verify-otp', async (req, res) => {
+  const { email, otp } = req.body;
+  if (!email || !otp) return res.status(400).json({ message: 'Email and OTP are required' });
+
+  try {
+    const user = await User.findOne({ email });
+    if (!user || user.resetOtp !== otp || !user.resetOtpExpiry || user.resetOtpExpiry < new Date())
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+
+    res.json({ message: 'OTP verified' });
+  } catch (err) {
+    console.error('POST /verify-otp', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+/* Step 3 — set new password */
+router.post('/reset-password', async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+  if (!email || !otp || !newPassword)
+    return res.status(400).json({ message: 'Email, OTP, and new password are required' });
+  if (newPassword.length < 8)
+    return res.status(400).json({ message: 'Password must be at least 8 characters' });
+
+  try {
+    const user = await User.findOne({ email });
+    if (!user || user.resetOtp !== otp || !user.resetOtpExpiry || user.resetOtpExpiry < new Date())
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.resetOtp = null;
+    user.resetOtpExpiry = null;
+    user.updated_at = new Date();
+    await user.save();
+
+    res.json({ message: 'Password reset successfully' });
+  } catch (err) {
+    console.error('POST /reset-password', err);
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
