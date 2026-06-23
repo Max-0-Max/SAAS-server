@@ -71,6 +71,7 @@ router.get('/team', authMiddleware, async (req, res) => {
   }
 });
 
+<<<<<<< HEAD
 // POST /api/notifications/team/accept-post  — accept after user has authenticated
 // Called by the frontend AFTER sign-in/sign-up so the token is consumed safely
 router.post('/team/accept-post', authMiddleware, async (req, res) => {
@@ -97,6 +98,9 @@ router.post('/team/accept-post', authMiddleware, async (req, res) => {
 });
 
 // GET  /api/notifications/team/accept   — legacy redirect (email clients that follow redirects)
+=======
+// GET  /api/notifications/team/accept   — accept invite via token link
+>>>>>>> 84374c2e0b54acc2d30c4127e90ec81757189c8f
 // ⚠ MUST be before /team/:id routes
 router.get('/team/accept', async (req, res) => {
   try {
