@@ -200,9 +200,8 @@ router.post('/forgot-password', async (req, res) => {
     const otp = generateOtp();
     const expiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    user.resetOtp = otp;
-    user.resetOtpExpiry = expiry;
-    await user.save();
+    // Use $set directly so the fields are written even on pre-existing documents
+    await User.updateOne({ _id: user._id }, { $set: { resetOtp: otp, resetOtpExpiry: expiry } });
 
     await sendEmail({
       to: email,
@@ -241,8 +240,9 @@ router.post('/verify-otp', async (req, res) => {
   if (!email || !otp) return res.status(400).json({ message: 'Email and OTP are required' });
 
   try {
-    const user = await User.findOne({ email });
-    if (!user || user.resetOtp !== otp || !user.resetOtpExpiry || user.resetOtpExpiry < new Date())
+    // .lean() bypasses Mongoose model cache and reads raw document from DB
+    const user = await User.findOne({ email }).lean();
+    if (!user || user.resetOtp !== otp || !user.resetOtpExpiry || new Date(user.resetOtpExpiry) < new Date())
       return res.status(400).json({ message: 'Invalid or expired OTP' });
 
     res.json({ message: 'OTP verified' });
@@ -261,15 +261,16 @@ router.post('/reset-password', async (req, res) => {
     return res.status(400).json({ message: 'Password must be at least 8 characters' });
 
   try {
-    const user = await User.findOne({ email });
-    if (!user || user.resetOtp !== otp || !user.resetOtpExpiry || user.resetOtpExpiry < new Date())
+    // .lean() reads raw DB document — bypasses any Mongoose field caching
+    const user = await User.findOne({ email }).lean();
+    if (!user || user.resetOtp !== otp || !user.resetOtpExpiry || new Date(user.resetOtpExpiry) < new Date())
       return res.status(400).json({ message: 'Invalid or expired OTP' });
 
-    user.password = await bcrypt.hash(newPassword, 10);
-    user.resetOtp = null;
-    user.resetOtpExpiry = null;
-    user.updated_at = new Date();
-    await user.save();
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await User.updateOne(
+      { _id: user._id },
+      { $set: { password: hashedPassword, updated_at: new Date() }, $unset: { resetOtp: '', resetOtpExpiry: '' } }
+    );
 
     res.json({ message: 'Password reset successfully' });
   } catch (err) {
