@@ -12,6 +12,9 @@ const UserSchema = new mongoose.Schema({
   subscription_tier: { type: String, enum: ['free', 'pro', 'enterprise'], default: 'free' },
   stripeCustomerId: { type: String, default: null },
   stripeSubscriptionId: { type: String, default: null },
+  // Password reset via OTP
+  resetOtp:       { type: String, default: null },
+  resetOtpExpiry: { type: Date,   default: null },
   created_at: { type: Date, default: Date.now },
   updated_at: { type: Date, default: Date.now },
 });
