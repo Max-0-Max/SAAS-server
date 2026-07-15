@@ -4,6 +4,8 @@ const UserSchema = new mongoose.Schema({
   name: String,
   email: { type: String, unique: true },
   password: String,
+ // Present only for accounts created/linked via "Sign in with Google"
+  googleId: { type: String, default: null, unique: true, sparse: true },
   avatar_url: String,
   role: { type: String, default: '' },
   timezone: { type: String, default: 'UTC' },
