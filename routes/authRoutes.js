@@ -5,12 +5,14 @@ const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
 const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const authMiddleware = require('../middleware/auth');
 const { sendEmail } = require('../jobs/notificationJob');
 require('dotenv').config();
 
 const router = express.Router();
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 /* ── Multer: avatar uploads ── */
 const storage = multer.diskStorage({
@@ -45,6 +47,8 @@ function formatUser(user) {
     language: user.language || 'English (US)',
     date_format: user.date_format || 'MM/DD/YYYY',
     subscription_tier: user.subscription_tier || 'free',
+    google_linked: !!user.googleId,
+    has_password: !!user.password,
     created_at: user.created_at,
   };
 }
@@ -75,6 +79,10 @@ router.post('/login', async (req, res) => {
     const user = await User.findOne({ email });
     if (!user) return res.status(400).json({ message: 'Invalid credentials' });
 
+    if (!user.password) {
+      return res.status(400).json({ message: 'This account uses Google Sign-In. Please continue with Google.' });
+    }
+
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
 
@@ -83,6 +91,137 @@ router.post('/login', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Internal Server Error' });
+  }
+});
+
+/* ── GOOGLE SIGN-IN / SIGN-UP ──
+   Frontend sends the Google ID token (the `credential` returned by
+   Google Identity Services) in the body. We verify it server-side,
+   then either log the matching user in or create a new one. ── */
+router.post('/google', async (req, res) => {
+  const { credential } = req.body;
+  if (!credential) return res.status(400).json({ message: 'Missing Google credential' });
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    console.error('POST /auth/google: GOOGLE_CLIENT_ID is not configured');
+    return res.status(500).json({ message: 'Google Sign-In is not configured on the server' });
+  }
+
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    if (!payload || !payload.email) {
+      return res.status(400).json({ message: 'Invalid Google credential' });
+    }
+
+    const { sub: googleId, email, name, picture, email_verified } = payload;
+    if (!email_verified) {
+      return res.status(400).json({ message: 'Google email is not verified' });
+    }
+
+    // Match by googleId first, then fall back to email so an existing
+    // password-based account gets linked instead of duplicated.
+    let user = await User.findOne({ googleId });
+    if (!user) {
+      user = await User.findOne({ email });
+      if (user) {
+        user.googleId = googleId;
+        if (!user.avatar_url && picture) user.avatar_url = picture;
+        user.updated_at = new Date();
+        await user.save();
+      }
+    }
+
+    if (!user) {
+      user = new User({
+        name: name || email.split('@')[0],
+        email,
+        googleId,
+        avatar_url: picture || undefined,
+      });
+      await user.save();
+    }
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: formatUser(user) });
+  } catch (err) {
+    console.error('POST /auth/google', err);
+    res.status(401).json({ message: 'Google Sign-In failed. Please try again.' });
+  }
+});
+
+/* ── LINK GOOGLE — connect Google to an already-logged-in account ──
+   POST /api/auth/link-google   { credential }   (requires auth) ── */
+router.post('/link-google', authMiddleware, async (req, res) => {
+  const { credential } = req.body;
+  if (!credential) return res.status(400).json({ message: 'Missing Google credential' });
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    console.error('POST /auth/link-google: GOOGLE_CLIENT_ID is not configured');
+    return res.status(500).json({ message: 'Google Sign-In is not configured on the server' });
+  }
+
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    if (!payload || !payload.email || !payload.email_verified) {
+      return res.status(400).json({ message: 'Invalid Google credential' });
+    }
+
+    const { sub: googleId, email, picture } = payload;
+
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    if (email.toLowerCase() !== user.email.toLowerCase()) {
+      return res.status(400).json({ message: `That Google account is signed in as ${email}, which doesn't match your account email.` });
+    }
+
+    const existing = await User.findOne({ googleId });
+    if (existing && String(existing._id) !== String(user._id)) {
+      return res.status(400).json({ message: 'That Google account is already linked to a different Nexus account.' });
+    }
+
+    user.googleId = googleId;
+    if (!user.avatar_url && picture) user.avatar_url = picture;
+    user.updated_at = new Date();
+    await user.save();
+
+    res.json(formatUser(user));
+  } catch (err) {
+    console.error('POST /auth/link-google', err);
+    res.status(401).json({ message: 'Failed to link Google account. Please try again.' });
+  }
+});
+
+/* ── UNLINK GOOGLE — disconnect Google from the account ──
+   DELETE /api/auth/google   (requires auth)
+   Blocked if the account has no password, since that would lock the
+   user out entirely — they must set a password first. ── */
+router.delete('/google', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    if (!user.googleId) {
+      return res.status(400).json({ message: 'No Google account is linked.' });
+    }
+    if (!user.password) {
+      return res.status(400).json({ message: 'Set a password first so you don\'t get locked out, then disconnect Google.' });
+    }
+
+    user.googleId = null;
+    user.updated_at = new Date();
+    await user.save();
+
+    res.json(formatUser(user));
+  } catch (err) {
+    console.error('DELETE /auth/google', err);
+    res.status(500).json({ message: 'Failed to disconnect Google account.' });
   }
 });
 
@@ -142,16 +281,21 @@ router.post('/me/avatar', authMiddleware, upload.single('avatar'), async (req, r
 router.put('/me/password', authMiddleware, async (req, res) => {
   try {
     const { current_password, new_password } = req.body;
-    if (!current_password || !new_password)
-      return res.status(400).json({ message: 'Both current and new password are required' });
+    if (!new_password)
+      return res.status(400).json({ message: 'New password is required' });
     if (new_password.length < 8)
       return res.status(400).json({ message: 'New password must be at least 8 characters' });
 
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const isMatch = await bcrypt.compare(current_password, user.password);
-    if (!isMatch) return res.status(400).json({ message: 'Current password is incorrect' });
+    if (user.password) {
+      // Normal case: must prove you know the current password
+      if (!current_password) return res.status(400).json({ message: 'Current password is required' });
+      const isMatch = await bcrypt.compare(current_password, user.password);
+      if (!isMatch) return res.status(400).json({ message: 'Current password is incorrect' });
+    }
+    // else: Google-only account with no password yet — setting the first one requires no current_password
 
     user.password = await bcrypt.hash(new_password, 10);
     user.updated_at = new Date();
