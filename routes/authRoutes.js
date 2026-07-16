@@ -6,6 +6,8 @@ const fs = require('fs');
 const multer = require('multer');
 const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
+const { authenticator } = require('otplib');
+const QRCode = require('qrcode');
 const User = require('../models/User');
 const authMiddleware = require('../middleware/auth');
 const { sendEmail } = require('../jobs/notificationJob');
@@ -49,6 +51,7 @@ function formatUser(user) {
     subscription_tier: user.subscription_tier || 'free',
     google_linked: !!user.googleId,
     has_password: !!user.password,
+    two_factor_enabled: !!user.twoFactorEnabled,
     created_at: user.created_at,
   };
 }
@@ -85,6 +88,11 @@ router.post('/login', async (req, res) => {
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
+
+    if (user.twoFactorEnabled) {
+      const pendingToken = jwt.sign({ id: user._id, twofa_pending: true }, process.env.JWT_SECRET, { expiresIn: '10m' });
+      return res.json({ requires_2fa: true, pending_token: pendingToken });
+    }
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: formatUser(user) });
@@ -222,6 +230,143 @@ router.delete('/google', authMiddleware, async (req, res) => {
   } catch (err) {
     console.error('DELETE /auth/google', err);
     res.status(500).json({ message: 'Failed to disconnect Google account.' });
+  }
+});
+
+/* ── 2FA: SETUP — generate a secret + QR code (not yet enabled) ──
+   POST /api/auth/2fa/setup   (requires auth) ── */
+router.post('/2fa/setup', authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (user.twoFactorEnabled) return res.status(400).json({ message: '2FA is already enabled' });
+
+    const secret = authenticator.generateSecret();
+    user.twoFactorTempSecret = secret;
+    await user.save();
+
+    const otpauth = authenticator.keyuri(user.email, 'Nexus', secret);
+    const qrCodeDataUrl = await QRCode.toDataURL(otpauth);
+
+    res.json({ qr_code: qrCodeDataUrl, secret });
+  } catch (err) {
+    console.error('POST /auth/2fa/setup', err);
+    res.status(500).json({ message: 'Failed to start 2FA setup' });
+  }
+});
+
+/* ── 2FA: VERIFY SETUP — confirm the code from the authenticator app,
+   turn 2FA on, and hand back one-time backup codes ──
+   POST /api/auth/2fa/verify-setup   { code }   (requires auth) ── */
+router.post('/2fa/verify-setup', authMiddleware, async (req, res) => {
+  try {
+    const { code } = req.body;
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (!user.twoFactorTempSecret) return res.status(400).json({ message: 'Start 2FA setup first' });
+    if (!code) return res.status(400).json({ message: 'Verification code is required' });
+
+    const isValid = authenticator.verify({ token: code, secret: user.twoFactorTempSecret });
+    if (!isValid) return res.status(400).json({ message: 'Invalid code. Check your app and try again.' });
+
+    // Generate 8 human-friendly single-use backup codes; store only their hashes.
+    const plainBackupCodes = Array.from({ length: 8 }, () =>
+      crypto.randomBytes(5).toString('hex').toUpperCase().match(/.{1,5}/g).join('-')
+    );
+    const hashedBackupCodes = await Promise.all(plainBackupCodes.map(c => bcrypt.hash(c, 10)));
+
+    user.twoFactorSecret = user.twoFactorTempSecret;
+    user.twoFactorTempSecret = null;
+    user.twoFactorEnabled = true;
+    user.backupCodes = hashedBackupCodes;
+    user.updated_at = new Date();
+    await user.save();
+
+    res.json({ enabled: true, backup_codes: plainBackupCodes });
+  } catch (err) {
+    console.error('POST /auth/2fa/verify-setup', err);
+    res.status(500).json({ message: 'Failed to verify 2FA code' });
+  }
+});
+
+/* ── 2FA: DISABLE ──
+   POST /api/auth/2fa/disable   { password, code }   (requires auth)
+   Requires proof of ownership: current password (if the account has one)
+   PLUS a valid 2FA code or backup code, so an attacker with just a
+   stolen session can't turn protection off. ── */
+router.post('/2fa/disable', authMiddleware, async (req, res) => {
+  try {
+    const { password, code } = req.body;
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (!user.twoFactorEnabled) return res.status(400).json({ message: '2FA is not enabled' });
+
+    if (user.password) {
+      if (!password) return res.status(400).json({ message: 'Password is required to disable 2FA' });
+      const passwordOk = await bcrypt.compare(password, user.password);
+      if (!passwordOk) return res.status(400).json({ message: 'Incorrect password' });
+    }
+
+    if (!code) return res.status(400).json({ message: '2FA code is required to disable 2FA' });
+    const codeOk = authenticator.verify({ token: code, secret: user.twoFactorSecret });
+    let backupUsed = false;
+    if (!codeOk) {
+      for (const hashed of user.backupCodes) {
+        if (await bcrypt.compare(code, hashed)) { backupUsed = true; break; }
+      }
+      if (!backupUsed) return res.status(400).json({ message: 'Invalid 2FA code' });
+    }
+
+    user.twoFactorEnabled = false;
+    user.twoFactorSecret = null;
+    user.twoFactorTempSecret = null;
+    user.backupCodes = [];
+    user.updated_at = new Date();
+    await user.save();
+
+    res.json(formatUser(user));
+  } catch (err) {
+    console.error('POST /auth/2fa/disable', err);
+    res.status(500).json({ message: 'Failed to disable 2FA' });
+  }
+});
+
+/* ── 2FA: LOGIN VERIFY — second step of login when 2FA is enabled ──
+   POST /api/auth/2fa/login-verify   { pending_token, code }
+   (no authMiddleware — the pending_token itself is the credential) ── */
+router.post('/2fa/login-verify', async (req, res) => {
+  try {
+    const { pending_token, code } = req.body;
+    if (!pending_token || !code) return res.status(400).json({ message: 'Missing pending token or code' });
+
+    let decoded;
+    try {
+      decoded = jwt.verify(pending_token, process.env.JWT_SECRET);
+    } catch {
+      return res.status(401).json({ message: 'Login session expired. Please log in again.' });
+    }
+    if (!decoded.twofa_pending) return res.status(400).json({ message: 'Invalid pending token' });
+
+    const user = await User.findById(decoded.id);
+    if (!user || !user.twoFactorEnabled) return res.status(400).json({ message: 'Invalid request' });
+
+    const isValid = authenticator.verify({ token: code, secret: user.twoFactorSecret });
+    let usedBackupIndex = -1;
+    if (!isValid) {
+      for (let i = 0; i < user.backupCodes.length; i++) {
+        if (await bcrypt.compare(code, user.backupCodes[i])) { usedBackupIndex = i; break; }
+      }
+      if (usedBackupIndex === -1) return res.status(400).json({ message: 'Invalid code' });
+      // Backup codes are single-use — remove it once spent.
+      user.backupCodes.splice(usedBackupIndex, 1);
+      await user.save();
+    }
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: formatUser(user), used_backup_code: usedBackupIndex !== -1 });
+  } catch (err) {
+    console.error('POST /auth/2fa/login-verify', err);
+    res.status(500).json({ message: 'Failed to verify 2FA code' });
   }
 });
 
