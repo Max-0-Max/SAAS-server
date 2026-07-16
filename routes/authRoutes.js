@@ -152,6 +152,11 @@ router.post('/google', async (req, res) => {
       await user.save();
     }
 
+    if (user.twoFactorEnabled) {
+      const pendingToken = jwt.sign({ id: user._id, twofa_pending: true }, process.env.JWT_SECRET, { expiresIn: '10m' });
+      return res.json({ requires_2fa: true, pending_token: pendingToken });
+    }
+
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: formatUser(user) });
   } catch (err) {
