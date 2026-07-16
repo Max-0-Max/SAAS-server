@@ -7,6 +7,11 @@ module.exports = function authMiddleware(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (decoded.twofa_pending) {
+      // This token only proves the password step passed; it can't be used
+      // to access anything until the 2FA code (or a backup code) is verified.
+      return res.status(401).json({ message: '2FA verification required' });
+    }
     req.userId = decoded.id;
     next();
   } catch {
