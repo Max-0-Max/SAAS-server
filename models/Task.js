@@ -9,6 +9,9 @@ const TaskSchema = new mongoose.Schema({
   priority: { type: String, enum: ['low', 'medium', 'high'], default: 'medium' },
   due_date: { type: Date },
   position: { type: Number, default: 0 },
+  // The team member this task is assigned to (must be an active member of the
+  // task owner's workspace). Null/absent means unassigned.
+  assigned_to: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   created_at: { type: Date, default: Date.now },
   updated_at: { type: Date, default: Date.now },
 });
