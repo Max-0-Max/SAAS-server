@@ -3,7 +3,7 @@ const Task    = require('../models/Task');
 const User    = require('../models/User');
 const TeamMember = require('../models/TeamMember');
 const NotificationPrefs = require('../models/NotificationPrefs');
-const { sendEmail } = require('../jobs/notificationJob');
+const { sendEmail, formatFriendlyDateTime } = require('../jobs/notificationJob');
 const authMiddleware = require('../middleware/auth');
 
 const PLAN_LIMITS = { free: 50, pro: Infinity, enterprise: Infinity }; // 50 tasks per project
@@ -64,7 +64,7 @@ async function notifyAssignee({ assignedTo, ownerId, task }) {
             <p style="color:#555;margin:0 0 8px;"><strong>${owner?.name || 'A teammate'}</strong> assigned you:</p>
             <div style="padding:14px 16px;background:#f9f9ff;border-left:4px solid #6C47FF;border-radius:8px;margin:12px 0 24px;">
               <p style="margin:0;font-weight:600;font-size:15px;">${task.title}</p>
-              ${task.due_date ? `<p style="margin:4px 0 0;font-size:12px;color:#888;">Due: ${new Date(task.due_date).toLocaleDateString()}</p>` : ''}
+              ${task.due_date ? `<p style="margin:4px 0 0;font-size:12px;color:#888;">Due: ${formatFriendlyDateTime(task.due_date)}</p>` : ''}
             </div>
             <a href="${clientUrl}/projects"
                style="display:inline-block;padding:13px 28px;background:#6C47FF;color:white;border-radius:10px;text-decoration:none;font-weight:700;font-size:15px;">
@@ -137,6 +137,10 @@ router.put('/:id', async (req, res) => {
         const assigneeChanged = String(task.assigned_to || '') !== String(resolvedAssignee || '');
         updates.assigned_to = resolvedAssignee;
         if (assigneeChanged) notifyAssignee({ assignedTo: resolvedAssignee, ownerId: req.userId, task: { ...task.toObject(), ...updates } });
+      }
+      if ('due_date' in updates && String(updates.due_date || '') !== String(task.due_date || '')) {
+        updates.reminder_60_sent = false;
+        updates.reminder_30_sent = false;
       }
     } else {
       // Assignee: status changes only, nothing else.
