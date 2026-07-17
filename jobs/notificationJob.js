@@ -122,16 +122,35 @@ function wrapEmail(title, bodyHtml) {
 }
 
 function taskCard(task, badge) {
-  const colors = { overdue: '#EF4444', today: '#F59E0B', tomorrow: '#6C47FF' };
+  const colors = { overdue: '#EF4444', today: '#F59E0B', tomorrow: '#6C47FF', hour: '#EF4444', halfhour: '#EF4444' };
   const color = colors[badge] || '#6C47FF';
-  const labels = { overdue: 'OVERDUE', today: 'DUE TODAY', tomorrow: 'DUE TOMORROW' };
+  const labels = { overdue: 'OVERDUE', today: 'DUE TODAY', tomorrow: 'DUE TOMORROW', hour: 'DUE IN 1 HOUR', halfhour: 'DUE IN 30 MINUTES' };
   return `
     <div style="padding:14px 16px; background:#f9f9ff; border-left:4px solid ${color}; border-radius:8px; margin-bottom:10px;">
       <span style="font-size:10px; font-weight:700; color:${color}; text-transform:uppercase; letter-spacing:0.5px;">${labels[badge]}</span>
       <p style="margin:4px 0 0; font-weight:600; font-size:15px;">${task.title}</p>
-      ${task.due_date ? `<p style="margin:2px 0 0; font-size:12px; color:#888;">Due: ${new Date(task.due_date).toLocaleDateString()}</p>` : ''}
+      ${task.due_date ? `<p style="margin:2px 0 0; font-size:12px; color:#888;">Due: ${formatFriendlyDateTime(task.due_date)}</p>` : ''}
     </div>
   `;
+}
+
+/**
+ * Human-friendly "15th July 11:59pm" style formatting, matching how
+ * deadlines are shown in the app.
+ */
+function formatFriendlyDateTime(dateInput) {
+  const d = new Date(dateInput);
+  const day = d.getDate();
+  const suffix = (n => {
+    if (n >= 11 && n <= 13) return 'th';
+    switch (n % 10) { case 1: return 'st'; case 2: return 'nd'; case 3: return 'rd'; default: return 'th'; }
+  })(day);
+  const month = d.toLocaleString('en-US', { month: 'long' });
+  let hours = d.getHours();
+  const minutes = d.getMinutes().toString().padStart(2, '0');
+  const ampm = hours >= 12 ? 'pm' : 'am';
+  hours = hours % 12 || 12;
+  return `${day}${suffix} ${month} ${hours}:${minutes}${ampm}`;
 }
 
 /* ── Main job ────────────────────────────────────────────────────────── */
@@ -288,6 +307,70 @@ async function runDailyChecks() {
   }
 }
 
+/* ── Deadline reminders (1hr / 30min before due, task not yet done) ──
+   Runs frequently (every 5 min) since these are time-sensitive, unlike
+   the once-a-day digest above. Each task only ever gets one "1 hour"
+   email and one "30 minute" email, tracked via reminder_60_sent /
+   reminder_30_sent so re-running the cron doesn't duplicate them. ── */
+async function checkDeadlineReminders() {
+  try {
+    const now = new Date();
+    const candidates = await Task.find({
+      status: { $ne: 'done' },
+      due_date: { $ne: null, $gte: now }, // only tasks still in the future
+      $or: [{ reminder_60_sent: false }, { reminder_30_sent: false }],
+    });
+
+    for (const task of candidates) {
+      try {
+        const minutesLeft = (new Date(task.due_date) - now) / 60000;
+        let badge = null;
+
+        if (minutesLeft <= 30 && !task.reminder_30_sent) {
+          badge = 'halfhour';
+          task.reminder_30_sent = true;
+          task.reminder_60_sent = true; // that window has passed too — don't send it separately
+        } else if (minutesLeft <= 60 && !task.reminder_60_sent) {
+          badge = 'hour';
+          task.reminder_60_sent = true;
+        }
+
+        if (!badge) continue;
+
+        // Remind whoever is responsible for the task right now.
+        const recipientId = task.assigned_to || task.user_id;
+        const [user, prefs] = await Promise.all([
+          User.findById(recipientId).select('name email'),
+          NotificationPrefs.findOne({ user_id: recipientId }),
+        ]);
+        await task.save();
+
+        if (!user || !user.email) continue;
+        if (prefs && prefs.email_reminders === false) continue; // respect their preference
+
+        const label = badge === 'halfhour' ? '30 minutes' : '1 hour';
+        await sendEmail({
+          to: user.email,
+          subject: `⏰ "${task.title}" is due in ${label} — Nexus`,
+          html: wrapEmail(
+            `Deadline coming up, ${user.name}`,
+            `<p style="color:#555; margin:0 0 20px;">This task is due in <strong>${label}</strong> and hasn't been marked done yet:</p>
+             ${taskCard(task, badge)}
+             <a href="${process.env.CLIENT_URL || 'http://localhost:5173'}/projects"
+                style="display:inline-block; margin-top:20px; padding:12px 24px; background:#6C47FF; color:white; border-radius:10px; text-decoration:none; font-weight:600;">
+               Open Projects →
+             </a>`
+          ),
+        });
+      } catch (taskErr) {
+        console.error(`[NotificationJob] Deadline reminder failed for task ${task._id}:`, taskErr.message);
+      }
+    }
+  } catch (err) {
+    console.error('[NotificationJob] checkDeadlineReminders fatal error:', err);
+  }
+}
+
 /* ── Cron scheduler ──────────────────────────────────────────────────── */
 
 function startCron() {
@@ -301,10 +384,16 @@ function startCron() {
     runDailyChecks();
   }, { timezone: 'UTC' });
 
-  console.log('[NotificationJob] Cron scheduled: daily at 08:00 UTC');
+  // Run every 5 minutes — catches the 1hr/30min deadline windows without
+  // waiting for the once-a-day digest.
+  cron.schedule('*/5 * * * *', () => {
+    checkDeadlineReminders();
+  });
+
+  console.log('[NotificationJob] Cron scheduled: daily at 08:00 UTC, deadline reminders every 5 minutes');
 }
 
-module.exports = { sendEmail, runDailyChecks, startCron };
+module.exports = { sendEmail, runDailyChecks, checkDeadlineReminders, startCron, formatFriendlyDateTime };
 
 /* ── Helper ── */
 function statBox(emoji, value, label) {
