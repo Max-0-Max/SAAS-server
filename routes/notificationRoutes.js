@@ -71,6 +71,30 @@ router.get('/team', authMiddleware, async (req, res) => {
   }
 });
 
+// GET  /api/notifications/team/invite-info  — public: look up an invite by token
+// so the frontend can show who invited them and lock the email field to the
+// address the invite was actually sent to.
+// ⚠ MUST be before /team/:id routes
+router.get('/team/invite-info', async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (!token) return res.status(400).json({ message: 'Token required' });
+
+    const member = await TeamMember.findOne({ invite_token: token });
+    if (!member) {
+      // Either invalid, or already accepted — check if a member with this
+      // token ever existed isn't knowable once invite_token is cleared, so
+      // just report "not found" either way.
+      return res.status(404).json({ message: 'This invite link is invalid or has already been used.' });
+    }
+
+    const owner = await User.findById(member.owner_id).select('name email');
+    res.json({ email: member.email, role: member.role, owner_name: owner?.name || 'Someone' });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // POST /api/notifications/team/accept-post  — accept after user has authenticated
 // Called by the frontend AFTER sign-in/sign-up so the token is consumed safely
 router.post('/team/accept-post', authMiddleware, async (req, res) => {
@@ -82,6 +106,15 @@ router.post('/team/accept-post', authMiddleware, async (req, res) => {
     if (!member) {
       // Token already consumed (idempotent) — still success
       return res.json({ message: 'Already accepted' });
+    }
+
+    const user = await User.findById(req.userId).select('email');
+    if (!user || user.email.toLowerCase() !== member.email.toLowerCase()) {
+      // Don't consume the token — let the person log out and accept as the right account.
+      return res.status(403).json({
+        message: `This invite was sent to ${member.email}, but you're signed in as ${user?.email || 'a different account'}.`,
+        invited_email: member.email,
+      });
     }
 
     member.status = 'active';
