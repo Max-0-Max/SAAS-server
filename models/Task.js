@@ -12,6 +12,9 @@ const TaskSchema = new mongoose.Schema({
   // The team member this task is assigned to (must be an active member of the
   // task owner's workspace). Null/absent means unassigned.
   assigned_to: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  // Deadline reminder tracking — reset to false whenever due_date changes.
+  reminder_60_sent: { type: Boolean, default: false },
+  reminder_30_sent: { type: Boolean, default: false },
   created_at: { type: Date, default: Date.now },
   updated_at: { type: Date, default: Date.now },
 });
