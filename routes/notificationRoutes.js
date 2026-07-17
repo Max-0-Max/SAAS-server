@@ -224,6 +224,7 @@ router.delete('/team/:id', authMiddleware, async (req, res) => {
 function formatMember(m) {
   return {
     id:       m._id,
+    user_id:  m.user_id || null,
     email:    m.email,
     name:     m.name,
     role:     m.role,
