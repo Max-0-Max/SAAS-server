@@ -131,6 +131,36 @@ router.post('/', async (req, res) => {
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
 });
 
+/* ── REORDER (drag-and-drop) ── Owner only.
+   Body: { updates: [{ id, position, status }, ...] } — one entry per task
+   whose position and/or status changed as a result of the drag. Only
+   touches tasks the requester actually owns; anything else is silently
+   skipped rather than erroring the whole batch. ── */
+router.put('/reorder', async (req, res) => {
+  try {
+    const { updates } = req.body;
+    if (!Array.isArray(updates) || updates.length === 0) {
+      return res.status(400).json({ message: 'updates array is required' });
+    }
+    if (updates.length > 200) {
+      return res.status(400).json({ message: 'Too many updates in one batch' });
+    }
+
+    const results = await Promise.all(updates.map(async u => {
+      if (!u || !u.id) return null;
+      const set = {};
+      if (typeof u.position === 'number') set.position = u.position;
+      if (typeof u.status === 'string') set.status = u.status;
+      if (Object.keys(set).length === 0) return null;
+      set.updated_at = new Date();
+      const updated = await Task.findOneAndUpdate({ _id: u.id, user_id: req.userId }, set, { new: true });
+      return updated ? formatTask(updated) : null;
+    }));
+
+    res.json(results.filter(Boolean));
+  } catch (err) { res.status(500).json({ message: 'Server Error' }); }
+});
+
 /* ── UPDATE ──
    Owners can edit any field, including reassigning the task.
    Assignees (who don't own the task) can only update its status. ── */
