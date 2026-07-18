@@ -25,7 +25,11 @@ app.use(cors({
   origin: (origin, cb) => {
     // allow requests with no origin (e.g. curl, Postman) or matching origins
     if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS: origin ${origin} not allowed`));
+    // Quietly deny (no CORS headers) rather than throwing — throwing here
+    // has no error handler to catch it and crashes the whole serverless
+    // function instead of just failing the one cross-origin request.
+    console.warn(`[CORS] Blocked request from disallowed origin: ${origin}`);
+    cb(null, false);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -50,5 +54,16 @@ app.use('/api/cron',          require('./routes/cronRoutes'));
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// Global error handler — must be registered last. Without this, any error
+// thrown or passed to next(err) anywhere above (including inside the cors
+// middleware, multer, JSON parsing, etc.) has nowhere to go, and on Vercel
+// that means the entire function invocation fails instead of returning a
+// normal error response.
+app.use((err, req, res, next) => {
+  console.error(`[Unhandled error] ${req.method} ${req.path}:`, err);
+  if (res.headersSent) return next(err);
+  res.status(err.statusCode || 500).json({ message: err.message || 'Internal server error' });
+});
 
 module.exports = app;
