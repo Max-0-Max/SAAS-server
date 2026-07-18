@@ -18,9 +18,28 @@ router.get('/', async (req, res) => {
     const filter = { $or: [{ user_id: req.userId }, { assigned_to: req.userId }] };
     if (req.query.project_id) filter.project_id = req.query.project_id;
     const tasks = await Task.find(filter).sort({ position: 1, created_at: -1 });
-    res.json(tasks.map(formatTask));
+
+    // For tasks assigned to me by someone else, attach my role in their team
+    // so the frontend knows whether I'm allowed to change its status
+    // (viewers are read-only).
+    const results = await Promise.all(tasks.map(async t => {
+      const formatted = formatTask(t);
+      if (t.assigned_to && String(t.assigned_to) === String(req.userId) && String(t.user_id) !== String(req.userId)) {
+        formatted.assignee_role = await getRoleInTeam(t.user_id, req.userId);
+      }
+      return formatted;
+    }));
+    res.json(results);
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
 });
+
+/* ── Helper: what role does userId hold in ownerId's team?
+   Returns 'owner' | 'admin' | 'member' | 'viewer' | null (not on the team). ── */
+async function getRoleInTeam(ownerId, userId) {
+  if (String(ownerId) === String(userId)) return 'owner';
+  const member = await TeamMember.findOne({ owner_id: ownerId, user_id: userId, status: 'active' });
+  return member ? member.role : null;
+}
 
 /* ── Helper: verify assigned_to (if provided) is an active member of this
    owner's workspace, and return it normalized (null if unset/self isn't
@@ -143,8 +162,11 @@ router.put('/:id', async (req, res) => {
         updates.reminder_30_sent = false;
       }
     } else {
-      // Assignee: status changes only, nothing else.
+      // Assignee: status changes only, nothing else — and only if their role
+      // in the task owner's team allows it. Viewers are read-only.
       if (!('status' in req.body)) return res.status(403).json({ message: 'You can only update this task\'s status' });
+      const role = await getRoleInTeam(task.user_id, req.userId);
+      if (role === 'viewer') return res.status(403).json({ message: 'Viewers can view assigned tasks but can\'t update their status.' });
       updates = { status: req.body.status };
     }
 
