@@ -1,54 +1,54 @@
 const express = require('express');
-const cors = require('cors');
-const path = require('path');
-const connectDB = require('./config/db');
-require('dotenv').config();
+const { runDailyChecks, checkDeadlineReminders } = require('../jobs/notificationJob');
 
-const app = express();
-connectDB();
+const router = express.Router();
 
-// Start notification cron — only meaningful on a persistently-running
-// process (VPS, Render, Railway, etc). On Vercel/serverless there's no
-// long-running process for node-cron to tick in, so scheduling is instead
-// handled via the HTTP-triggered /api/cron/* routes below.
-const { startCron } = require('./jobs/notificationJob');
-if (!process.env.VERCEL) {
-  startCron();
-} else {
-  console.log('[NotificationJob] Running on Vercel — use /api/cron/daily-digest and /api/cron/deadline-reminders with an external scheduler instead of node-cron.');
+/**
+ * These routes exist because node-cron's in-process scheduling doesn't work
+ * on serverless platforms (Vercel/Netlify) — there's no long-running process
+ * for it to tick in. Instead, an external scheduler (or Vercel's own Cron
+ * Jobs feature) hits these endpoints on a schedule.
+ *
+ * Auth: expects the shared secret either as `Authorization: Bearer <secret>`
+ * (this is exactly the header Vercel Cron sends automatically) or as a
+ * `?secret=` query param (for schedulers that can't set custom headers).
+ */
+function verifyCronSecret(req, res, next) {
+  if (!process.env.CRON_SECRET) {
+    console.error('[cron] CRON_SECRET is not set — refusing all cron requests.');
+    return res.status(500).json({ message: 'Cron endpoint not configured' });
+  }
+  const header = req.headers['authorization'];
+  const provided = (header && header.replace(/^Bearer\s+/i, '')) || req.query.secret;
+  if (provided !== process.env.CRON_SECRET) {
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+  next();
 }
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:5174')
-  .split(',').map(o => o.trim());
+// Suggested schedule: once daily (fits Vercel Hobby's cron limit).
+// vercel.json -> { "path": "/api/cron/daily-digest", "schedule": "0 8 * * *" }
+router.get('/daily-digest', verifyCronSecret, async (req, res) => {
+  try {
+    await runDailyChecks();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[cron] daily-digest failed:', err);
+    res.status(500).json({ ok: false });
+  }
+});
 
-app.use(cors({
-  origin: (origin, cb) => {
-    // allow requests with no origin (e.g. curl, Postman) or matching origins
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS: origin ${origin} not allowed`));
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
+// Suggested schedule: every 5 minutes. Vercel Hobby can't do this natively —
+// point a free external scheduler (e.g. cron-job.org) at this URL instead:
+//   https://<your-domain>/api/cron/deadline-reminders?secret=<CRON_SECRET>
+router.get('/deadline-reminders', verifyCronSecret, async (req, res) => {
+  try {
+    await checkDeadlineReminders();
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[cron] deadline-reminders failed:', err);
+    res.status(500).json({ ok: false });
+  }
+});
 
-// ⚠️ Webhook needs raw body — register BEFORE express.json()
-app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), require('./routes/billingRoutes').webhook);
-
-app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-app.use('/api/auth',          require('./routes/authRoutes'));
-app.use('/api/projects',      require('./routes/projectRoutes'));
-app.use('/api/tasks',         require('./routes/taskRoutes'));
-app.use('/api/goals',         require('./routes/goalRoutes'));
-app.use('/api/habits',        require('./routes/habitRoutes'));
-app.use('/api/notes',         require('./routes/noteRoutes'));
-app.use('/api/billing',       require('./routes/billingRoutes'));
-app.use('/api/notifications', require('./routes/notificationRoutes'));
-app.use('/api/cron',          require('./routes/cronRoutes'));
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-module.exports = app;
+module.exports = router;
