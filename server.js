@@ -7,9 +7,16 @@ require('dotenv').config();
 const app = express();
 connectDB();
 
-// Start notification cron (no-op if SMTP not configured)
+// Start notification cron — only meaningful on a persistently-running
+// process (VPS, Render, Railway, etc). On Vercel/serverless there's no
+// long-running process for node-cron to tick in, so scheduling is instead
+// handled via the HTTP-triggered /api/cron/* routes below.
 const { startCron } = require('./jobs/notificationJob');
-startCron();
+if (!process.env.VERCEL) {
+  startCron();
+} else {
+  console.log('[NotificationJob] Running on Vercel — use /api/cron/daily-digest and /api/cron/deadline-reminders with an external scheduler instead of node-cron.');
+}
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:5174')
   .split(',').map(o => o.trim());
@@ -39,6 +46,7 @@ app.use('/api/habits',        require('./routes/habitRoutes'));
 app.use('/api/notes',         require('./routes/noteRoutes'));
 app.use('/api/billing',       require('./routes/billingRoutes'));
 app.use('/api/notifications', require('./routes/notificationRoutes'));
+app.use('/api/cron',          require('./routes/cronRoutes'));
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
