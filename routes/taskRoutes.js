@@ -107,7 +107,7 @@ router.post('/', async (req, res) => {
 
     const task = new Task({ user_id: req.userId, project_id, title, description, status, priority, due_date, position, assigned_to: resolvedAssignee });
     await task.save();
-    notifyAssignee({ assignedTo: resolvedAssignee, ownerId: req.userId, task });
+    await notifyAssignee({ assignedTo: resolvedAssignee, ownerId: req.userId, task });
     res.status(201).json(formatTask(task));
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
 });
@@ -136,7 +136,7 @@ router.put('/:id', async (req, res) => {
         }
         const assigneeChanged = String(task.assigned_to || '') !== String(resolvedAssignee || '');
         updates.assigned_to = resolvedAssignee;
-        if (assigneeChanged) notifyAssignee({ assignedTo: resolvedAssignee, ownerId: req.userId, task: { ...task.toObject(), ...updates } });
+        if (assigneeChanged) await notifyAssignee({ assignedTo: resolvedAssignee, ownerId: req.userId, task: { ...task.toObject(), ...updates } });
       }
       if ('due_date' in updates && String(updates.due_date || '') !== String(task.due_date || '')) {
         updates.reminder_60_sent = false;
