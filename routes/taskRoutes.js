@@ -3,6 +3,7 @@ const Task    = require('../models/Task');
 const User    = require('../models/User');
 const TeamMember = require('../models/TeamMember');
 const NotificationPrefs = require('../models/NotificationPrefs');
+const ActivityLog = require('../models/ActivityLog');
 const { sendEmail, formatFriendlyDateTime } = require('../jobs/notificationJob');
 const authMiddleware = require('../middleware/auth');
 
@@ -98,6 +99,24 @@ async function notifyAssignee({ assignedTo, ownerId, task }) {
   }
 }
 
+/* ── Helper: record an activity entry. Best-effort — a logging failure
+   should never block the actual task operation. Awaited by callers so it
+   completes within the request (same reasoning as notifyAssignee). ── */
+async function logActivity({ taskId, projectId, actorId, action, details, taskTitle }) {
+  try {
+    await ActivityLog.create({
+      task_id: taskId,
+      project_id: projectId,
+      actor_id: actorId,
+      action,
+      details: details || {},
+      meta: { task_title: taskTitle },
+    });
+  } catch (err) {
+    console.error('logActivity failed:', err.message);
+  }
+}
+
 /* ── CREATE ── */
 router.post('/', async (req, res) => {
   try {
@@ -127,6 +146,7 @@ router.post('/', async (req, res) => {
     const task = new Task({ user_id: req.userId, project_id, title, description, status, priority, due_date, position, assigned_to: resolvedAssignee });
     await task.save();
     await notifyAssignee({ assignedTo: resolvedAssignee, ownerId: req.userId, task });
+    await logActivity({ taskId: task._id, projectId: task.project_id, actorId: req.userId, action: 'created', taskTitle: task.title });
     res.status(201).json(formatTask(task));
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
 });
@@ -174,6 +194,8 @@ router.put('/:id', async (req, res) => {
     if (!isOwner && !isAssignee) return res.status(404).json({ message: 'Task not found' });
 
     let updates;
+    const activityEntries = [];
+
     if (isOwner) {
       updates = { ...req.body };
       if ('assigned_to' in updates) {
@@ -185,11 +207,22 @@ router.put('/:id', async (req, res) => {
         }
         const assigneeChanged = String(task.assigned_to || '') !== String(resolvedAssignee || '');
         updates.assigned_to = resolvedAssignee;
-        if (assigneeChanged) await notifyAssignee({ assignedTo: resolvedAssignee, ownerId: req.userId, task: { ...task.toObject(), ...updates } });
+        if (assigneeChanged) {
+          await notifyAssignee({ assignedTo: resolvedAssignee, ownerId: req.userId, task: { ...task.toObject(), ...updates } });
+          const action = !task.assigned_to ? 'assigned' : !resolvedAssignee ? 'unassigned' : 'reassigned';
+          activityEntries.push({ action, details: { from: task.assigned_to || null, to: resolvedAssignee || null } });
+        }
       }
       if ('due_date' in updates && String(updates.due_date || '') !== String(task.due_date || '')) {
         updates.reminder_60_sent = false;
         updates.reminder_30_sent = false;
+        activityEntries.push({ action: 'due_date_changed', details: { from: task.due_date || null, to: updates.due_date || null } });
+      }
+      if ('status' in updates && updates.status !== task.status) {
+        activityEntries.push({ action: 'status_changed', details: { from: task.status, to: updates.status } });
+      }
+      if (('title' in updates && updates.title !== task.title) || ('description' in updates && updates.description !== task.description)) {
+        activityEntries.push({ action: 'edited', details: {} });
       }
     } else {
       // Assignee: status changes only, nothing else — and only if their role
@@ -198,9 +231,15 @@ router.put('/:id', async (req, res) => {
       const role = await getRoleInTeam(task.user_id, req.userId);
       if (role === 'viewer') return res.status(403).json({ message: 'Viewers can view assigned tasks but can\'t update their status.' });
       updates = { status: req.body.status };
+      if (updates.status !== task.status) {
+        activityEntries.push({ action: 'status_changed', details: { from: task.status, to: updates.status } });
+      }
     }
 
     const updated = await Task.findByIdAndUpdate(req.params.id, { ...updates, updated_at: new Date() }, { new: true });
+    await Promise.all(activityEntries.map(entry => logActivity({
+      taskId: task._id, projectId: task.project_id, actorId: req.userId, taskTitle: updated.title, ...entry,
+    })));
     res.json(formatTask(updated));
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
 });
@@ -208,9 +247,39 @@ router.put('/:id', async (req, res) => {
 /* ── DELETE ── */
 router.delete('/:id', async (req, res) => {
   try {
-    const task = await Task.findOneAndDelete({ _id: req.params.id, user_id: req.userId });
+    const task = await Task.findOne({ _id: req.params.id, user_id: req.userId });
     if (!task) return res.status(404).json({ message: 'Task not found' });
+    await logActivity({ taskId: task._id, projectId: task.project_id, actorId: req.userId, action: 'deleted', taskTitle: task.title });
+    await Task.deleteOne({ _id: task._id });
     res.json({ message: 'Task deleted' });
+  } catch (err) { res.status(500).json({ message: 'Server Error' }); }
+});
+
+/* ── ACTIVITY — history of changes on a task ──
+   Visible to the task owner and its assignee (same visibility as the task
+   itself). Actor names are resolved for display. ── */
+router.get('/:id/activity', async (req, res) => {
+  try {
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ message: 'Task not found' });
+
+    const isOwner = String(task.user_id) === String(req.userId);
+    const isAssignee = task.assigned_to && String(task.assigned_to) === String(req.userId);
+    if (!isOwner && !isAssignee) return res.status(404).json({ message: 'Task not found' });
+
+    const entries = await ActivityLog.find({ task_id: task._id }).sort({ created_at: -1 }).limit(100);
+    const actorIds = [...new Set(entries.map(e => String(e.actor_id)))];
+    const actors = await User.find({ _id: { $in: actorIds } }).select('name email');
+    const actorMap = Object.fromEntries(actors.map(a => [String(a._id), a.name || a.email]));
+
+    res.json(entries.map(e => ({
+      id: e._id,
+      action: e.action,
+      details: e.details,
+      actor_name: actorMap[String(e.actor_id)] || 'Someone',
+      actor_id: e.actor_id,
+      created_at: e.created_at,
+    })));
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
 });
 
