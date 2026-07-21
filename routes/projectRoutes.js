@@ -38,7 +38,7 @@ router.post('/', async (req, res) => {
     const { name, description, color } = req.body;
     const project = new Project({ user_id: req.userId, name, description, color });
     await project.save();
-    await logActivity({ entityType: 'project', projectId: project._id, actorId: req.userId, action: 'project_created', title: project.name });
+    await logActivity({ entityType: 'project', projectId: project._id, actorId: req.userId, ownerId: req.userId, action: 'project_created', title: project.name });
     res.status(201).json(formatProject(project));
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
 });
@@ -56,7 +56,7 @@ router.put('/:id', async (req, res) => {
     );
     const changed = ['name', 'description', 'color'].some(f => f in req.body && req.body[f] !== before[f]);
     if (changed) {
-      await logActivity({ entityType: 'project', projectId: project._id, actorId: req.userId, action: 'project_edited', title: project.name });
+      await logActivity({ entityType: 'project', projectId: project._id, actorId: req.userId, ownerId: req.userId, action: 'project_edited', title: project.name });
     }
     res.json(formatProject(project));
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
@@ -67,7 +67,7 @@ router.delete('/:id', async (req, res) => {
   try {
     const project = await Project.findOne({ _id: req.params.id, user_id: req.userId });
     if (!project) return res.status(404).json({ message: 'Project not found' });
-    await logActivity({ entityType: 'project', projectId: project._id, actorId: req.userId, action: 'project_deleted', title: project.name });
+    await logActivity({ entityType: 'project', projectId: project._id, actorId: req.userId, ownerId: req.userId, action: 'project_deleted', title: project.name });
     await Project.deleteOne({ _id: project._id });
     // Cascade delete tasks
     await Task.deleteMany({ project_id: req.params.id });
