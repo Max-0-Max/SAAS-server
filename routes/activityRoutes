@@ -1,0 +1,68 @@
+const express = require('express');
+const Task = require('../models/Task');
+const Project = require('../models/Project');
+const User = require('../models/User');
+const ActivityLog = require('../models/ActivityLog');
+const authMiddleware = require('../middleware/auth');
+
+const router = express.Router();
+
+/* ── GET /api/activity/feed ──
+   Workspace-wide activity: every logged change across every task the
+   requester can see — tasks they own, AND tasks assigned to them by someone
+   else (same visibility rule used everywhere else in the app). Every actor
+   who touched a task appears here regardless of their role (owner, admin,
+   member, or viewer-adjacent assignee) — logActivity always records the
+   real req.userId that performed the action, with no role-based filtering
+   on write, so nothing is hidden or attributed differently based on role.
+   Supports simple pagination via ?before=<ISO date>&limit=<n>. ── */
+router.get('/feed', authMiddleware, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+    const before = req.query.before ? new Date(req.query.before) : null;
+
+    const visibleTasks = await Task.find({
+      $or: [{ user_id: req.userId }, { assigned_to: req.userId }],
+    }).select('_id project_id');
+
+    const taskIds = visibleTasks.map(t => t._id);
+    if (taskIds.length === 0) return res.json({ entries: [], has_more: false });
+
+    const filter = { task_id: { $in: taskIds } };
+    if (before) filter.created_at = { $lt: before };
+
+    // Fetch one extra to know if there's more beyond this page.
+    const entries = await ActivityLog.find(filter).sort({ created_at: -1 }).limit(limit + 1);
+    const hasMore = entries.length > limit;
+    const page = entries.slice(0, limit);
+
+    const actorIds = [...new Set(page.map(e => String(e.actor_id)))];
+    const projectIds = [...new Set(page.map(e => e.project_id).filter(Boolean).map(String))];
+    const [actors, projects] = await Promise.all([
+      User.find({ _id: { $in: actorIds } }).select('name email'),
+      Project.find({ _id: { $in: projectIds } }).select('name'),
+    ]);
+    const actorMap = Object.fromEntries(actors.map(a => [String(a._id), a.name || a.email]));
+    const projectMap = Object.fromEntries(projects.map(p => [String(p._id), p.name]));
+
+    res.json({
+      entries: page.map(e => ({
+        id: e._id,
+        task_id: e.task_id,
+        action: e.action,
+        details: e.details,
+        actor_name: actorMap[String(e.actor_id)] || 'Someone',
+        actor_id: e.actor_id,
+        task_title: e.meta?.task_title || 'Untitled task',
+        project_name: projectMap[String(e.project_id)] || null,
+        created_at: e.created_at,
+      })),
+      has_more: hasMore,
+    });
+  } catch (err) {
+    console.error('GET /activity/feed', err);
+    res.status(500).json({ message: 'Server Error' });
+  }
+});
+
+module.exports = router;
