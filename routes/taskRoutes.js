@@ -129,7 +129,7 @@ router.post('/', async (req, res) => {
     const task = new Task({ user_id: req.userId, project_id, title, description, status, priority, due_date, position, assigned_to: resolvedAssignee });
     await task.save();
     await notifyAssignee({ assignedTo: resolvedAssignee, ownerId: req.userId, task });
-    await logActivity({ taskId: task._id, projectId: task.project_id, actorId: req.userId, action: 'created', title: task.title });
+    await logActivity({ taskId: task._id, projectId: task.project_id, actorId: req.userId, ownerId: req.userId, assigneeId: resolvedAssignee, action: 'created', title: task.title });
     res.status(201).json(formatTask(task));
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
 });
@@ -173,6 +173,7 @@ router.put('/reorder', async (req, res) => {
       if (typeof u.status === 'string' && u.status !== current.status) {
         await logActivity({
           taskId: updated._id, projectId: updated.project_id, actorId: req.userId,
+          ownerId: current.user_id, assigneeId: updated.assigned_to,
           action: 'status_changed', details: { from: current.status, to: u.status }, title: updated.title,
         });
       }
@@ -240,7 +241,8 @@ router.put('/:id', async (req, res) => {
 
     const updated = await Task.findByIdAndUpdate(req.params.id, { ...updates, updated_at: new Date() }, { new: true });
     await Promise.all(activityEntries.map(entry => logActivity({
-      taskId: task._id, projectId: task.project_id, actorId: req.userId, title: updated.title, ...entry,
+      taskId: task._id, projectId: task.project_id, actorId: req.userId,
+      ownerId: task.user_id, assigneeId: updated.assigned_to, title: updated.title, ...entry,
     })));
     res.json(formatTask(updated));
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
@@ -251,7 +253,7 @@ router.delete('/:id', async (req, res) => {
   try {
     const task = await Task.findOne({ _id: req.params.id, user_id: req.userId });
     if (!task) return res.status(404).json({ message: 'Task not found' });
-    await logActivity({ taskId: task._id, projectId: task.project_id, actorId: req.userId, action: 'deleted', title: task.title });
+    await logActivity({ taskId: task._id, projectId: task.project_id, actorId: req.userId, ownerId: task.user_id, assigneeId: task.assigned_to, action: 'deleted', title: task.title });
     await Task.deleteOne({ _id: task._id });
     res.json({ message: 'Task deleted' });
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
