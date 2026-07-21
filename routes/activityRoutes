@@ -1,5 +1,4 @@
 const express = require('express');
-const Task = require('../models/Task');
 const Project = require('../models/Project');
 const User = require('../models/User');
 const ActivityLog = require('../models/ActivityLog');
@@ -8,33 +7,24 @@ const authMiddleware = require('../middleware/auth');
 const router = express.Router();
 
 /* ── GET /api/activity/feed ──
-   Workspace-wide activity: every logged change across every task the
-   requester can see — tasks they own, AND tasks assigned to them by someone
-   else (same visibility rule used everywhere else in the app). Every actor
-   who touched a task appears here regardless of their role (owner, admin,
-   member, or viewer-adjacent assignee) — logActivity always records the
-   real req.userId that performed the action, with no role-based filtering
-   on write, so nothing is hidden or attributed differently based on role.
+   Workspace-wide activity: every logged change for anything you own
+   (projects and tasks, past or present) plus anything ever assigned to you.
+   Deliberately does NOT re-derive visibility by looking up currently-
+   existing tasks/projects — owner_id/assignee_id are denormalized snapshots
+   recorded on the log entry itself at write time, so deleting a task or
+   project can never erase its own history from this feed.
+   Every actor who touched something appears here regardless of their role
+   (owner, admin, member, or viewer-adjacent assignee) — logActivity always
+   records the real req.userId that performed the action, with no
+   role-based filtering on write.
    Supports simple pagination via ?before=<ISO date>&limit=<n>. ── */
 router.get('/feed', authMiddleware, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
     const before = req.query.before ? new Date(req.query.before) : null;
 
-    const [visibleTasks, ownedProjects] = await Promise.all([
-      Task.find({ $or: [{ user_id: req.userId }, { assigned_to: req.userId }] }).select('_id'),
-      Project.find({ user_id: req.userId }).select('_id'), // project-level entries (created/edited/deleted) are owner-only
-    ]);
-    const taskIds = visibleTasks.map(t => t._id);
-    const projectIds = ownedProjects.map(p => p._id);
-
-    if (taskIds.length === 0 && projectIds.length === 0) return res.json({ entries: [], has_more: false });
-
     const filter = {
-      $or: [
-        { task_id: { $in: taskIds } },
-        { entity_type: 'project', project_id: { $in: projectIds } },
-      ],
+      $or: [{ owner_id: req.userId }, { assignee_id: req.userId }],
     };
     if (before) filter.created_at = { $lt: before };
 
@@ -47,7 +37,7 @@ router.get('/feed', authMiddleware, async (req, res) => {
     const projIds = [...new Set(page.map(e => e.project_id).filter(Boolean).map(String))];
     const [actors, projects] = await Promise.all([
       User.find({ _id: { $in: actorIds } }).select('name email'),
-      Project.find({ _id: { $in: projIds } }).select('name'),
+      Project.find({ _id: { $in: projIds } }).select('name'), // best-effort — may be a deleted project, that's fine
     ]);
     const actorMap = Object.fromEntries(actors.map(a => [String(a._id), a.name || a.email]));
     const projectMap = Object.fromEntries(projects.map(p => [String(p._id), p.name]));
