@@ -21,14 +21,21 @@ router.get('/feed', authMiddleware, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
     const before = req.query.before ? new Date(req.query.before) : null;
 
-    const visibleTasks = await Task.find({
-      $or: [{ user_id: req.userId }, { assigned_to: req.userId }],
-    }).select('_id project_id');
-
+    const [visibleTasks, ownedProjects] = await Promise.all([
+      Task.find({ $or: [{ user_id: req.userId }, { assigned_to: req.userId }] }).select('_id'),
+      Project.find({ user_id: req.userId }).select('_id'), // project-level entries (created/edited/deleted) are owner-only
+    ]);
     const taskIds = visibleTasks.map(t => t._id);
-    if (taskIds.length === 0) return res.json({ entries: [], has_more: false });
+    const projectIds = ownedProjects.map(p => p._id);
 
-    const filter = { task_id: { $in: taskIds } };
+    if (taskIds.length === 0 && projectIds.length === 0) return res.json({ entries: [], has_more: false });
+
+    const filter = {
+      $or: [
+        { task_id: { $in: taskIds } },
+        { entity_type: 'project', project_id: { $in: projectIds } },
+      ],
+    };
     if (before) filter.created_at = { $lt: before };
 
     // Fetch one extra to know if there's more beyond this page.
@@ -37,10 +44,10 @@ router.get('/feed', authMiddleware, async (req, res) => {
     const page = entries.slice(0, limit);
 
     const actorIds = [...new Set(page.map(e => String(e.actor_id)))];
-    const projectIds = [...new Set(page.map(e => e.project_id).filter(Boolean).map(String))];
+    const projIds = [...new Set(page.map(e => e.project_id).filter(Boolean).map(String))];
     const [actors, projects] = await Promise.all([
       User.find({ _id: { $in: actorIds } }).select('name email'),
-      Project.find({ _id: { $in: projectIds } }).select('name'),
+      Project.find({ _id: { $in: projIds } }).select('name'),
     ]);
     const actorMap = Object.fromEntries(actors.map(a => [String(a._id), a.name || a.email]));
     const projectMap = Object.fromEntries(projects.map(p => [String(p._id), p.name]));
@@ -48,12 +55,13 @@ router.get('/feed', authMiddleware, async (req, res) => {
     res.json({
       entries: page.map(e => ({
         id: e._id,
+        entity_type: e.entity_type,
         task_id: e.task_id,
         action: e.action,
         details: e.details,
         actor_name: actorMap[String(e.actor_id)] || 'Someone',
         actor_id: e.actor_id,
-        task_title: e.meta?.task_title || 'Untitled task',
+        task_title: e.meta?.title || (e.entity_type === 'project' ? 'Untitled project' : 'Untitled task'),
         project_name: projectMap[String(e.project_id)] || null,
         created_at: e.created_at,
       })),
