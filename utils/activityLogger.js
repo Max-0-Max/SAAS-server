@@ -1,28 +1,29 @@
-const ActivityLog = require('../models/ActivityLog');
+const mongoose = require('mongoose');
 
-/**
- * Record an activity entry. Best-effort — a logging failure should never
- * block the actual operation it's describing. Callers should `await` this
- * (not fire-and-forget) so it can't get dropped by a serverless platform
- * freezing the function right after the response is sent.
- *
- * entityType: 'task' | 'project' — task_id is required for 'task' entries,
- * omitted for 'project'-level entries (e.g. project created/deleted).
- */
-async function logActivity({ entityType = 'task', taskId, projectId, actorId, action, details, title }) {
-  try {
-    await ActivityLog.create({
-      entity_type: entityType,
-      task_id: entityType === 'task' ? taskId : undefined,
-      project_id: projectId,
-      actor_id: actorId,
-      action,
-      details: details || {},
-      meta: { title },
-    });
-  } catch (err) {
-    console.error('logActivity failed:', err.message);
-  }
-}
 
-module.exports = { logActivity };
+const ActivityLogSchema = new mongoose.Schema({
+  entity_type: { type: String, enum: ['task', 'project'], default: 'task' },
+  task_id:    { type: mongoose.Schema.Types.ObjectId, ref: 'Task' }, // required for entity_type: 'task'
+  project_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Project' },
+  actor_id:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  owner_id:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, // whose workspace this belongs to
+  assignee_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // snapshot of assigned_to at the time, if any
+  action: {
+    type: String,
+    enum: [
+      'created', 'status_changed', 'assigned', 'unassigned', 'reassigned', 'due_date_changed', 'edited', 'deleted',
+      'project_created', 'project_edited', 'project_deleted',
+    ],
+    required: true,
+  },
+  details: { type: mongoose.Schema.Types.Mixed, default: {} }, // e.g. { from: 'todo', to: 'done' }
+  meta:    { type: mongoose.Schema.Types.Mixed, default: {} }, // e.g. { title: '...' } — survives task/project deletion/edits
+  created_at: { type: Date, default: Date.now },
+});
+
+ActivityLogSchema.index({ task_id: 1, created_at: -1 });
+ActivityLogSchema.index({ project_id: 1, created_at: -1 });
+ActivityLogSchema.index({ owner_id: 1, created_at: -1 });
+ActivityLogSchema.index({ assignee_id: 1, created_at: -1 });
+
+module.exports = mongoose.model('ActivityLog', ActivityLogSchema, 'ActivityLog');
