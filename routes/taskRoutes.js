@@ -3,6 +3,7 @@ const Task    = require('../models/Task');
 const User    = require('../models/User');
 const TeamMember = require('../models/TeamMember');
 const NotificationPrefs = require('../models/NotificationPrefs');
+const { logActivity } = require('../utils/activityLogger');
 const ActivityLog = require('../models/ActivityLog');
 const { sendEmail, formatFriendlyDateTime } = require('../jobs/notificationJob');
 const authMiddleware = require('../middleware/auth');
@@ -99,24 +100,6 @@ async function notifyAssignee({ assignedTo, ownerId, task }) {
   }
 }
 
-/* ── Helper: record an activity entry. Best-effort — a logging failure
-   should never block the actual task operation. Awaited by callers so it
-   completes within the request (same reasoning as notifyAssignee). ── */
-async function logActivity({ taskId, projectId, actorId, action, details, taskTitle }) {
-  try {
-    await ActivityLog.create({
-      task_id: taskId,
-      project_id: projectId,
-      actor_id: actorId,
-      action,
-      details: details || {},
-      meta: { task_title: taskTitle },
-    });
-  } catch (err) {
-    console.error('logActivity failed:', err.message);
-  }
-}
-
 /* ── CREATE ── */
 router.post('/', async (req, res) => {
   try {
@@ -146,7 +129,7 @@ router.post('/', async (req, res) => {
     const task = new Task({ user_id: req.userId, project_id, title, description, status, priority, due_date, position, assigned_to: resolvedAssignee });
     await task.save();
     await notifyAssignee({ assignedTo: resolvedAssignee, ownerId: req.userId, task });
-    await logActivity({ taskId: task._id, projectId: task.project_id, actorId: req.userId, action: 'created', taskTitle: task.title });
+    await logActivity({ taskId: task._id, projectId: task.project_id, actorId: req.userId, action: 'created', title: task.title });
     res.status(201).json(formatTask(task));
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
 });
@@ -166,15 +149,34 @@ router.put('/reorder', async (req, res) => {
       return res.status(400).json({ message: 'Too many updates in one batch' });
     }
 
+    // Fetch current state first so we can tell which of these are just
+    // reorders (position only) vs an actual status change (drag between
+    // columns) — only the latter gets logged.
+    const ids = updates.filter(u => u && u.id).map(u => u.id);
+    const currentTasks = await Task.find({ _id: { $in: ids }, user_id: req.userId });
+    const currentById = Object.fromEntries(currentTasks.map(t => [String(t._id), t]));
+
     const results = await Promise.all(updates.map(async u => {
       if (!u || !u.id) return null;
+      const current = currentById[u.id];
+      if (!current) return null; // not found or not owned by this user
+
       const set = {};
       if (typeof u.position === 'number') set.position = u.position;
       if (typeof u.status === 'string') set.status = u.status;
       if (Object.keys(set).length === 0) return null;
       set.updated_at = new Date();
+
       const updated = await Task.findOneAndUpdate({ _id: u.id, user_id: req.userId }, set, { new: true });
-      return updated ? formatTask(updated) : null;
+      if (!updated) return null;
+
+      if (typeof u.status === 'string' && u.status !== current.status) {
+        await logActivity({
+          taskId: updated._id, projectId: updated.project_id, actorId: req.userId,
+          action: 'status_changed', details: { from: current.status, to: u.status }, title: updated.title,
+        });
+      }
+      return formatTask(updated);
     }));
 
     res.json(results.filter(Boolean));
@@ -238,7 +240,7 @@ router.put('/:id', async (req, res) => {
 
     const updated = await Task.findByIdAndUpdate(req.params.id, { ...updates, updated_at: new Date() }, { new: true });
     await Promise.all(activityEntries.map(entry => logActivity({
-      taskId: task._id, projectId: task.project_id, actorId: req.userId, taskTitle: updated.title, ...entry,
+      taskId: task._id, projectId: task.project_id, actorId: req.userId, title: updated.title, ...entry,
     })));
     res.json(formatTask(updated));
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
@@ -249,7 +251,7 @@ router.delete('/:id', async (req, res) => {
   try {
     const task = await Task.findOne({ _id: req.params.id, user_id: req.userId });
     if (!task) return res.status(404).json({ message: 'Task not found' });
-    await logActivity({ taskId: task._id, projectId: task.project_id, actorId: req.userId, action: 'deleted', taskTitle: task.title });
+    await logActivity({ taskId: task._id, projectId: task.project_id, actorId: req.userId, action: 'deleted', title: task.title });
     await Task.deleteOne({ _id: task._id });
     res.json({ message: 'Task deleted' });
   } catch (err) { res.status(500).json({ message: 'Server Error' }); }
