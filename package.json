@@ -1,6 +1,7 @@
 {
   "dependencies": {
     "bcryptjs": "^3.0.3",
+    "cloudinary": "^2.5.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
@@ -10,9 +11,9 @@
     "mongoose": "^9.0.1",
     "multer": "^2.0.2",
     "node-cron": "^3.0.3",
-    "nodemailer": "^6.9.9",
     "otplib": "^12.0.1",
     "qrcode": "^1.5.4",
+    "resend": "^6.17.2",
     "stripe": "^14.0.0"
   }
 }
