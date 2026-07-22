@@ -46,6 +46,7 @@ app.use('/api/habits',        require('./routes/habitRoutes'));
 app.use('/api/notes',         require('./routes/noteRoutes'));
 app.use('/api/billing',       require('./routes/billingRoutes'));
 app.use('/api/notifications', require('./routes/notificationRoutes'));
+app.use('/api/comments',      require('./routes/commentRoutes'));
 app.use('/api/activity',      require('./routes/activityRoutes'));
 app.use('/api/search',        require('./routes/searchRoutes'));
 app.use('/api/cron',          require('./routes/cronRoutes'));
