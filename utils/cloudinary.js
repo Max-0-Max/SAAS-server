@@ -1,6 +1,12 @@
 const cloudinary = require('cloudinary').v2;
 
 let configured = false;
+function mask(val) {
+  if (!val) return '(not set)';
+  if (val.length <= 6) return `${val[0]}***(len:${val.length})`;
+  return `${val.slice(0, 3)}...${val.slice(-3)} (len:${val.length})`;
+}
+
 function ensureConfigured() {
   if (configured) return;
   cloudinary.config({
@@ -8,6 +14,14 @@ function ensureConfigured() {
     api_key: process.env.CLOUDINARY_API_KEY,
     api_secret: process.env.CLOUDINARY_API_SECRET,
   });
+  // Masked diagnostic — safe to leave in, never logs the real secret. Compare
+  // these lengths/prefixes against your Cloudinary dashboard if uploads fail
+  // with "Invalid Signature".
+  console.log('[Cloudinary config]',
+    'cloud_name=', process.env.CLOUDINARY_CLOUD_NAME || '(not set)',
+    '| api_key=', mask(process.env.CLOUDINARY_API_KEY),
+    '| api_secret=', mask(process.env.CLOUDINARY_API_SECRET),
+  );
   configured = true;
 }
 
